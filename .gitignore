@@ -1,0 +1,11 @@
+*.mat
+*.h5
+*.csv
+*.npz
+*.bin
+*.bin.optim
+*.slp
+*.avi
+JMSleap/*
+__pycache__/*
+**/.DS_Store
