@@ -59,7 +59,6 @@ def train(args: Dict):
     """
     device = torch.device("cuda:0" if args["--cuda"] else "cpu")
     # Prepare training data and validation data
-
     dataset = prepare_dataset(
         str(args["--path"]), int(args["--window-size"]), device=device
     )

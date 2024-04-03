@@ -33,7 +33,8 @@ class Feat2AnnotModel(nn.Module):
         self.hidden_size = hidden_size
         self.dropout_rate = dropout_rate
         self.target_class = target_class["class"]
-        self.class_weight = torch.tensor(target_class["weight"],dtype=torch.float32)
+        self.class_weight = target_class["weight"]
+        print(self.class_weight.type())
         # default values
         self.encoder = None
         self.decoder = None
@@ -50,29 +51,47 @@ class Feat2AnnotModel(nn.Module):
             hidden_size=hidden_size,
             bidirectional=True,
             batch_first=True,
+            device=self.device,
         )
         self.decoder = nn.LSTMCell(
-            input_size=self.target_class + hidden_size, hidden_size=hidden_size
+            input_size=self.target_class + hidden_size,
+            hidden_size=hidden_size,
+            device=self.device,
         )
         # Hidden state from bidirectional LSTM is passed through a linear layer
         self.h_projection = nn.Linear(
-            in_features=2 * hidden_size, out_features=hidden_size, bias=False
+            in_features=2 * hidden_size,
+            out_features=hidden_size,
+            bias=False,
+            device=self.device,
         )
         # Cell from bidirectional LSTM is passed through a linear layer
         self.c_projection = nn.Linear(
-            in_features=2 * hidden_size, out_features=hidden_size, bias=False
+            in_features=2 * hidden_size,
+            out_features=hidden_size,
+            bias=False,
+            device=self.device,
         )
         # Attention linear layer to calculate local attention scores (multiplicative attention between hidden of encoder and hidden of decoder)
         self.att_projection = nn.Linear(
-            in_features=2 * hidden_size, out_features=hidden_size, bias=False
+            in_features=2 * hidden_size,
+            out_features=hidden_size,
+            bias=False,
+            device=self.device,
         )
         # Takes the combined attention output and decoder (3h) project to combined output(1h)
         self.combined_output_projection = nn.Linear(
-            in_features=3 * hidden_size, out_features=hidden_size, bias=False
+            in_features=3 * hidden_size,
+            out_features=hidden_size,
+            bias=False,
+            device=self.device,
         )
         # Takes combined output project to annotation class space
         self.target_annot_projection = nn.Linear(
-            in_features=hidden_size, out_features=self.target_class, bias=False
+            in_features=hidden_size,
+            out_features=self.target_class,
+            bias=False,
+            device=self.device,
         )
         self.dropout = nn.Dropout(p=self.dropout_rate)
 
@@ -104,16 +123,18 @@ class Feat2AnnotModel(nn.Module):
         # weight_mat = torch.tensor(weight_mat, dtype=torch.float32, device=self.device)
         # weight_mat = (target!=0).float()
         weight_mat = self.class_weight[target]
-        change_point = torch.diff(torch.concat((target[:,0:1], target),dim=1),dim=1)
-        change_point = (change_point!=0).float()
+        change_point = torch.diff(torch.concat((target[:, 0:1], target), dim=1), dim=1)
+        change_point = (change_point != 0).float()
         # pass a cov1d to bleed all the changing point by 1 (left and right)
-        kernel = torch.tensor([[[1,1,1]]],dtype=torch.float32)
+        kernel = torch.tensor([[[1, 1, 1]]], dtype=torch.float32, device=self.device)
         # dimension is D-Kernel+1+Padding
-        change_point = F.conv1d(change_point.unsqueeze(1).float(), kernel,padding=1).squeeze(0)
-        change_point = (change_point>0).float().squeeze(1)
+        change_point = F.conv1d(
+            change_point.unsqueeze(1).float(), kernel, padding=1
+        ).squeeze(0)
+        change_point = (change_point > 0).float().squeeze(1)
         # normalize weight matrix across rows
         weight_mat = weight_mat * change_point
-        weight_mat = weight_mat/weight_mat.sum(dim=1,keepdim=True)
+        weight_mat = weight_mat / weight_mat.sum(dim=1, keepdim=True)
         target_ground_truth_annot_log_prob = (
             target_ground_truth_annot_log_prob * weight_mat
         )
@@ -165,7 +186,7 @@ class Feat2AnnotModel(nn.Module):
         dec_state = dec_init_state
         # Initialize previous combined output vector o_{t-1} as zero
         batch_size = enc_hiddens.size(0)
-        o_prev = torch.zeros(batch_size, self.hidden_size)
+        o_prev = torch.zeros(batch_size, self.hidden_size, device = self.device)
         # Initialize a list we will use to collect the combined output o_t on each step
         combined_outputs = []
         enc_hiddens_proj = self.att_projection(enc_hiddens)
@@ -347,7 +368,7 @@ class Feat2AnnotModel(nn.Module):
     @property
     def device(self) -> torch.device:
         """Determine which device to place the Tensors upon, CPU or GPU."""
-        return next(self.parameters()).device
+        return self.class_weight.device
 
     @staticmethod
     def load(model_path: str):

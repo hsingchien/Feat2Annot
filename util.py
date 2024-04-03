@@ -92,8 +92,8 @@ class PoseDataset(Dataset):
             assert self._annot_class >= annot_class, "invalid annotation class number. must geq the largest annotation class."
     def get_annot_class(self):
         _, all_annot = self[:]
-        _, counts = np.unique(all_annot,return_counts=True)
-        weights = 1/counts / np.sum(1/counts)
+        _, counts = np.unique(all_annot.cpu(),return_counts=True)
+        weights = torch.tensor(1/counts / np.sum(1/counts), device=self.device, dtype=torch.float32)
         annot_class = {"class": self._annot_class, "weight": weights}
         return annot_class
     
