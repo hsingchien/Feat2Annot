@@ -32,8 +32,8 @@ class Feat2AnnotModel(nn.Module):
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.dropout_rate = dropout_rate
-        self.target_class = target_class
-
+        self.target_class = target_class["class"]
+        self.class_weight = torch.tensor(target_class["weight"],dtype=torch.float32)
         # default values
         self.encoder = None
         self.decoder = None
@@ -52,7 +52,7 @@ class Feat2AnnotModel(nn.Module):
             batch_first=True,
         )
         self.decoder = nn.LSTMCell(
-            input_size=target_class + hidden_size, hidden_size=hidden_size
+            input_size=self.target_class + hidden_size, hidden_size=hidden_size
         )
         # Hidden state from bidirectional LSTM is passed through a linear layer
         self.h_projection = nn.Linear(
@@ -72,7 +72,7 @@ class Feat2AnnotModel(nn.Module):
         )
         # Takes combined output project to annotation class space
         self.target_annot_projection = nn.Linear(
-            in_features=hidden_size, out_features=target_class, bias=False
+            in_features=hidden_size, out_features=self.target_class, bias=False
         )
         self.dropout = nn.Dropout(p=self.dropout_rate)
 
@@ -99,9 +99,24 @@ class Feat2AnnotModel(nn.Module):
         ).squeeze(
             -1
         )  # (N, L)
-        weight_mat = exponential_weight(target)
-        weight_mat = torch.tensor(weight_mat,dtype=torch.float32,device=self.device)
-        target_ground_truth_annot_log_prob = target_ground_truth_annot_log_prob * weight_mat
+        # Apply two-way exponential filter at annotation altering point
+        # weight_mat = exponential_weight(target)
+        # weight_mat = torch.tensor(weight_mat, dtype=torch.float32, device=self.device)
+        # weight_mat = (target!=0).float()
+        weight_mat = self.class_weight[target]
+        change_point = torch.diff(torch.concat((target[:,0:1], target),dim=1),dim=1)
+        change_point = (change_point!=0).float()
+        # pass a cov1d to bleed all the changing point by 1 (left and right)
+        kernel = torch.tensor([[[1,1,1]]],dtype=torch.float32)
+        # dimension is D-Kernel+1+Padding
+        change_point = F.conv1d(change_point.unsqueeze(1).float(), kernel,padding=1).squeeze(0)
+        change_point = (change_point>0).float().squeeze(1)
+        # normalize weight matrix across rows
+        weight_mat = weight_mat * change_point
+        weight_mat = weight_mat/weight_mat.sum(dim=1,keepdim=True)
+        target_ground_truth_annot_log_prob = (
+            target_ground_truth_annot_log_prob * weight_mat
+        )
         scores = target_ground_truth_annot_log_prob.sum(dim=0)
         return scores
 
@@ -220,7 +235,7 @@ class Feat2AnnotModel(nn.Module):
         beam_size: int = 5,
         max_decoding_time_step: int = None,
     ) -> List[Hypothesis]:
-        """Given a single source sentence, perform beam search, yielding translations in the target language.
+        """Given a single source sequence, perform beam search, yielding predicted annotation.
         @param src_sent (List[str]): a single source behavior feature seq
         @param beam_size (int): beam size
         @param max_decoding_time_step (int): maximum number of time steps to unroll the decoding RNN
@@ -370,7 +385,7 @@ def exponential_weight(target, a=0.5):
     Takes a target sequence, pass symmetric exponential filter
     """
     b, l = target.shape
-    weight = np.concatenate((np.zeros((b, 1)), np.diff(target.numpy(),axis=1)), axis=1)
+    weight = np.concatenate((np.zeros((b, 1)), np.diff(target.numpy(), axis=1)), axis=1)
     # First find the ts where the label changed
     weight = (weight != 0).astype(float)
     weight_left = weight.copy()
@@ -378,8 +393,8 @@ def exponential_weight(target, a=0.5):
     for idx in range(1, weight.shape[1]):
         weight_left[:, idx] = weight_left[:, idx - 1] * a + (1 - a) * weight[:, idx]
         weight_right[:, l - idx - 1] = (
-            weight_right[:, l - idx] * a + (1 - a) * weight[:, l-idx]
+            weight_right[:, l - idx] * a + (1 - a) * weight[:, l - idx]
         )
     weight = weight_right + weight_left - (1 - a) * weight
-    weight = weight/np.sum(weight,axis=1,keepdims=True)
+    weight = weight / np.sum(weight, axis=1, keepdims=True)
     return weight

@@ -29,17 +29,24 @@ class PoseDataset(Dataset):
     def __len__(self):
         return len(self.valid_seq_index)
     
-    def __getitem__(self, index):
+    def __getitem__(self, index:np.ndarray):
         # Locate index
-        real_index = self.valid_seq_index[index]
-        idx = np.argmax(self._index>=(real_index+1))
-        start_idx = real_index - self._index[idx-1]
-        fdata = self.feature[idx-1]
-        fseq = fdata[start_idx:start_idx+self.window_length,:]
-        adata = self.annot[idx-1]
-        aseq = np.squeeze(adata[start_idx:start_idx+self.window_length,:])
-        fseq = torch.tensor(fseq,dtype=torch.float32,device=self.device)
-        aseq = torch.tensor(aseq,dtype=torch.int64, device=self.device)
+        if isinstance(index,int):
+            index = np.array([index])
+
+        real_indices = self.valid_seq_index[index]
+        # data chunk indices
+        idxs = np.array([np.argmax(self._index>=(real_index+1)) for real_index in real_indices], dtype=int)
+        # offset the cumulative length
+        start_idxs = real_indices - self._index[idxs-1]
+        # collect fdata chunks
+        fdatas = [self.feature[idx-1] for idx in idxs]
+        # collect fseq
+        fseq = np.stack([fdata[start_idx:start_idx+self.window_length,:] for start_idx, fdata in zip(start_idxs, fdatas)], axis=0)
+        adatas = [self.annot[idx-1] for idx in idxs]
+        aseq = np.stack([np.squeeze(adata[start_idx:start_idx+self.window_length,:]) for start_idx, adata in zip(start_idxs, adatas)], axis=0)
+        fseq = torch.tensor(np.squeeze(fseq),dtype=torch.float32,device=self.device)
+        aseq = torch.tensor(np.squeeze(aseq),dtype=torch.int64, device=self.device)
         return fseq,aseq
     
     def clear_boring_seqs(self):
@@ -84,7 +91,11 @@ class PoseDataset(Dataset):
         else:
             assert self._annot_class >= annot_class, "invalid annotation class number. must geq the largest annotation class."
     def get_annot_class(self):
-        return self._annot_class
+        _, all_annot = self[:]
+        _, counts = np.unique(all_annot,return_counts=True)
+        weights = 1/counts / np.sum(1/counts)
+        annot_class = {"class": self._annot_class, "weight": weights}
+        return annot_class
     
 
 def prepare_dataset(

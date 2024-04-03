@@ -2,17 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-CS224N 2020-21: Homework 4
-run.py: Run Script for Simple NMT Model
-Pencheng Yin <pcyin@cs.cmu.edu>
-Sahil Chopra <schopra8@stanford.edu>
-Vera Lin <veralin@stanford.edu>
-
 Usage:
     run.py train --path=<file> --window-size=<int> --feature-num=<int> [options]
-    run.py decode [options] MODEL_PATH TEST_SOURCE_FILE OUTPUT_FILE
-    run.py decode [options] MODEL_PATH TEST_SOURCE_FILE TEST_TARGET_FILE OUTPUT_FILE
-
+   
 Options:
     -h --help                               show this screen.
     --cuda                                  use GPU
