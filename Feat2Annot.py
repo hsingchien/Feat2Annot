@@ -34,7 +34,6 @@ class Feat2AnnotModel(nn.Module):
         self.dropout_rate = dropout_rate
         self.target_class = target_class["class"]
         self.class_weight = target_class["weight"]
-        print(self.class_weight.type())
         # default values
         self.encoder = None
         self.decoder = None
@@ -419,3 +418,39 @@ def exponential_weight(target, a=0.5):
     weight = weight_right + weight_left - (1 - a) * weight
     weight = weight / np.sum(weight, axis=1, keepdims=True)
     return weight
+
+
+class Feat2AnnotFCModel(nn.Module):
+    def __init__(self, input_size, hidden_size, target_class, dropout_rate=0.3, device = None):
+        super(Feat2AnnotFCModel,self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.dropout_rate = dropout_rate
+        self.target_class = target_class["class"]
+        self.class_weight = target_class["weight"]
+        if device is not None:
+            self.device = device
+        else:
+            self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        # Laying out NN layers
+        self.seq_layers = nn.Sequential()
+        hidden_size = [hidden_size] if isinstance(hidden_size, int) else hidden_size
+        ldims = [input_size] + hidden_size
+        for idx,l in enumerate(ldims):
+            if idx+1 >= len(ldims):
+                break
+            self.seq_layers.append(nn.Linear(l, ldims[idx+1],device=self.device))
+            self.seq_layers.append(nn.ReLU())
+            self.seq_layers.append(nn.BatchNorm1d(ldims[idx+1]))
+            self.seq_layers.append(nn.Dropout(self.dropout_rate))
+            
+        self.logit_layer = nn.Linear(ldims[-1], self.target_class,device=self.device)
+    
+    def forward(self, x):
+        output = self.seq_layers(x)
+        logits = self.logit_layer(output)
+        return logits
+        
+            
+            
+        

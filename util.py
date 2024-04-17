@@ -23,7 +23,6 @@ class PoseDataset(Dataset):
         self.clear_boring_seqs()
         self.transform = transform
         self.device = device
-
         super().__init__()
     
     def __len__(self):
@@ -70,10 +69,7 @@ class PoseDataset(Dataset):
                     pbar.update(self.window_length-1)
                 
        
-        self.valid_seq_index = np.nonzero(self.valid_seq_index)[0]
-
-
-    
+        self.valid_seq_index = np.nonzero(self.valid_seq_index)[0]   
     def _gen_index(self):
         """
         Generate index map: input index locate window from annot
@@ -96,8 +92,45 @@ class PoseDataset(Dataset):
         weights = torch.tensor(1/counts / np.sum(1/counts), device=self.device, dtype=torch.float32)
         annot_class = {"class": self._annot_class, "weight": weights}
         return annot_class
-    
 
+class PoseDatasetDiscrete(Dataset):
+    def __init__(self, feature: List[np.ndarray], annot: List[np.ndarray], annot_class:int=None, transform=None, device=torch.device('cpu')) -> None:
+        self._annot_class = annot_class
+        self._num_feature = None
+        self._class_weight = None
+        self.transform = transform
+        self.device = device
+        self._pack(feature, annot)
+        super().__init__()
+    def __len__(self):
+        return self.feature.shape[0]
+    def _pack(self,feature, annot):
+        annots = []
+        feats = []
+        for at,ft in zip(annot, feature):
+            assert at.shape[0] == ft.shape[0]
+            annots.append(at)
+            feats.append(ft)
+        self.annot = np.concatenate(annots,axis=0)
+        self.feature = np.concatenate(feats,axis=0)
+        uclasses, counts = np.unique(self.annot.flatten(), return_counts=True)
+        if self._annot_class is None:
+            self._annot_class = max((len(uclasses), np.max(uclasses)))
+            self._class_weight = torch.tensor(1/counts / np.sum(1/counts), device=self.device, dtype=torch.float32)
+        else:
+            assert self._annot_class >= max((len(uclasses), np.max(uclasses)))
+        self.annot = torch.tensor(self.annot,device=self.device,dtype=torch.int64)
+        self.feature = torch.tensor(self.feature,device=self.device,dtype=torch.float32)
+        self._num_feature = self.feature.shape[-1]      
+    def __getitem__(self, index):
+        fsample = self.feature[index,:]
+        asample = self.annot[index,:]
+        return fsample,asample
+    def get_annot_class(self):
+        return {"class": self._annot_class, "weight": self._class_weight}
+    def get_sample_weight(self):
+        return self._class_weight[self.annot.squeeze()]
+    
 def prepare_dataset(
     path: str,
     window_length: int,
@@ -133,6 +166,42 @@ def prepare_dataset(
             ft_transformed = sclr.transform(ft)
             feats.append(ft_transformed)
     dataset = PoseDataset(feats, annots, window_length,device=device)
+    return dataset
+
+def prepare_dataset_discrete(
+    path: str,
+    annot_dir: str = "annot.npz",
+    feature_dir: str = "feature.npz",
+    device = torch.device('cpu')
+):
+    """
+    path: directory containing npz annotation and tracking files
+    annot file: dict, each key value is a 2d ndarray, each entry is a annotation (t,1)
+    feat file: dict, same key as annot, same shape as annot, each entry is a feature (t, feat_num)
+    """
+    sclr = StandardScaler()
+    annot = np.load(path + directory_separator + "annotation" + directory_separator + annot_dir, allow_pickle=True)
+    feature = np.load(path + directory_separator + "tracking" + directory_separator + feature_dir, allow_pickle=True)
+    annots, feats = [], []
+    for k, i in annot.items():
+        fts = feature[k].flatten()
+        ats = i.flatten()
+        for i, (at, ft) in enumerate(zip(ats, fts)):
+            if at.size == 0:
+                continue
+            if at.shape[0] != ft.shape[0]:
+                continue
+            annots.append(at)
+            if np.mod(i,2) == 0:
+                # append partner features
+                ft = np.concatenate((ft, fts[i+1]),1)
+            else:
+                ft = np.concatenate((ft, fts[i-1]),1)
+            # normalize
+            sclr.fit(ft)
+            ft_transformed = sclr.transform(ft)
+            feats.append(ft_transformed)
+    dataset = PoseDatasetDiscrete(feats, annots, device=device)
     return dataset
 
 def transition_mat(dataframe, col="annot", transit_by=1, by="id", fill_value=0):
