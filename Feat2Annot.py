@@ -20,7 +20,7 @@ class Feat2AnnotModel(nn.Module):
     Unidirectional LSTM cell decoder outputs annotation
     """
 
-    def __init__(self, input_size, hidden_size, target_class, dropout_rate=0.2):
+    def __init__(self, input_size, hidden_size, target_class, dropout_rate=0.2, mlp=None):
         """Init Feat2Annot Model.
 
         @param input_size (int): feature size (dimensionality)
@@ -43,6 +43,7 @@ class Feat2AnnotModel(nn.Module):
         self.combined_output_projection = None
         self.target_vocab_projection = None
         self.dropout = None
+        self.mlp = mlp
 
         ## Laying out NN layers
         self.encoder = nn.LSTM(
@@ -85,9 +86,18 @@ class Feat2AnnotModel(nn.Module):
             bias=False,
             device=self.device,
         )
+        # Takes mlp output and project to hidden_size
+        if self.mlp is not None:
+            self.mlp_to_combined_out = nn.Linear(
+                in_features=self.mlp.hidden_size[-1],
+                out_features=hidden_size,
+                bias=True,
+                device=self.device,
+            )
+            
         # Takes combined output project to annotation class space
         self.target_annot_projection = nn.Linear(
-            in_features=hidden_size,
+            in_features=hidden_size if self.mlp is None else hidden_size*2,
             out_features=self.target_class,
             bias=False,
             device=self.device,
@@ -108,6 +118,12 @@ class Feat2AnnotModel(nn.Module):
         # Get sequence lengths
         enc_hiddens, dec_init_state = self.encode(source)
         combined_outputs = self.decode(enc_hiddens, dec_init_state, target)
+        # combined_outputs B,L,H
+        if self.mlp is not None:
+            B,L,D = source.shape
+            mlp_output = self.mlp_to_combined_out(self.mlp(source.view(-1,D))[1])
+            mlp_output = mlp_output.view(B,L,-1)
+            combined_outputs = torch.cat((combined_outputs,mlp_output),dim=-1)
         P = F.log_softmax(self.target_annot_projection(combined_outputs), dim=-1)
         # Batch x Length x Annot categories
         # Compute log probability of generating true target annotation
@@ -117,26 +133,30 @@ class Feat2AnnotModel(nn.Module):
         ).squeeze(
             -1
         )  # (N, L)
+        
         # Apply two-way exponential filter at annotation altering point
         # weight_mat = exponential_weight(target)
         # weight_mat = torch.tensor(weight_mat, dtype=torch.float32, device=self.device)
         # weight_mat = (target!=0).float()
         weight_mat = self.class_weight[target]
-        change_point = torch.diff(torch.concat((target[:, 0:1], target), dim=1), dim=1)
-        change_point = (change_point != 0).float()
-        # pass a cov1d to bleed all the changing point by 1 (left and right)
-        kernel = torch.tensor([[[1, 1, 1]]], dtype=torch.float32, device=self.device)
-        # dimension is D-Kernel+1+Padding
-        change_point = F.conv1d(
-            change_point.unsqueeze(1).float(), kernel, padding=1
-        ).squeeze(0)
-        change_point = (change_point > 0).float().squeeze(1)
-        # normalize weight matrix across rows
-        weight_mat = weight_mat * change_point
+        
+        # change_point = torch.diff(torch.concat((target[:, 0:1], target), dim=1), dim=1)
+        # change_point = (change_point != 0).float()
+        # # pass a cov1d to bleed all the changing point by 1 (left and right)
+        # kernel = torch.tensor([[[1, 1, 1]]], dtype=torch.float32, device=self.device)
+        # # dimension is D-Kernel+1+Padding
+        # change_point = F.conv1d(
+        #     change_point.unsqueeze(1).float(), kernel, padding=1
+        # ).squeeze(0)
+        # change_point = (change_point > 0).float().squeeze(1)
+        # # normalize weight matrix across rows
+        # weight_mat = weight_mat * change_point
         weight_mat = weight_mat / weight_mat.sum(dim=1, keepdim=True)
         target_ground_truth_annot_log_prob = (
             target_ground_truth_annot_log_prob * weight_mat
         )
+        
+        
         scores = target_ground_truth_annot_log_prob.sum(dim=0)
         return scores
 
@@ -263,13 +283,26 @@ class Feat2AnnotModel(nn.Module):
                 value: List[str]: the decoded target sentence, represented as a list of words
                 score: float: the log-likelihood of the target sentence
         """
+        B,L,D = src_seq.shape
+        if self.mlp is not None:
+            _,mlp_output = self.mlp(src_seq.view((-1,D))) # BxL,D
+            mlp_output = self.mlp_to_combined_out(mlp_output) # BxL, hidden_size
+            mlp_output = mlp_output.view((B,L,-1))
+        else:
+            mlp_output = None
+    
         src_encodings, dec_init_vec = self.encode(src_seq)  # (1, src_len, 2h)
         src_encodings_att_linear = self.att_projection(src_encodings)
 
         h_tm1 = dec_init_vec
         att_tm1 = torch.zeros(1, self.hidden_size, device=self.device)
-
+        
+        # instead of initialize with 0, we start from the inferred class
         hypotheses = [[0]]
+        lgts,_= self.mlp(src_seq[:,0,:].squeeze(1))
+        a_hat = torch.argmax(lgts,dim=-1).item()
+        hypotheses = [[a_hat]]
+        
 
         hyp_scores = torch.zeros(len(hypotheses), dtype=torch.float, device=self.device)
         completed_hypotheses = []
@@ -281,7 +314,6 @@ class Feat2AnnotModel(nn.Module):
         while t < max_decoding_time_step:
             t += 1
             hyp_num = len(hypotheses)
-
             exp_src_encodings = src_encodings.expand(
                 hyp_num, src_encodings.size(1), src_encodings.size(2)
             )
@@ -295,9 +327,7 @@ class Feat2AnnotModel(nn.Module):
             y_tm1 = torch.tensor(
                 [hyp[-1] for hyp in hypotheses], dtype=torch.long, device=self.device
             )  # (num_hypothe, 1)
-            # print(y_tm1, len(hypotheses))
             y_t_one_hot = F.one_hot(y_tm1, self.target_class)  # (num_hypo, behav_class)
-            # print(y_t_one_hot.shape,att_tm1.shape)
             x = torch.cat(
                 [y_t_one_hot, att_tm1], dim=-1
             )  # (num_hypo, behav_class+hidden)
@@ -310,8 +340,10 @@ class Feat2AnnotModel(nn.Module):
             )
             # att_t combined output, (num_hypo, hidden size)
             # log probabilities over target words
+            mlp_output_t = mlp_output[:,t-1,:].squeeze(1)
+            att_t_cmbed = torch.cat((att_t,mlp_output_t.expand(att_t.shape[0],-1)),dim=-1)
             log_p_t = F.log_softmax(
-                self.target_annot_projection(att_t), dim=-1
+                self.target_annot_projection(att_t_cmbed), dim=-1
             )  # (num_hypo, behav_class)
 
             live_hyp_num = beam_size - len(completed_hypotheses)
@@ -385,13 +417,13 @@ class Feat2AnnotModel(nn.Module):
         """Save the odel to a file.
         @param path (str): path to the model
         """
-        print("save model parameters to [%s]" % path, file=sys.stderr)
+        print(f"save model parameters to {path}")
 
         params = {
             "args": dict(
                 input_size=self.input_size,
                 hidden_size=self.hidden_size,
-                behav_class=self.target_class,
+                target_class={"class": self.target_class, "weight": self.class_weight},
                 dropout_rate=self.dropout_rate,
             ),
             "state_dict": self.state_dict(),
@@ -449,7 +481,31 @@ class Feat2AnnotFCModel(nn.Module):
     def forward(self, x):
         output = self.seq_layers(x)
         logits = self.logit_layer(output)
-        return logits
+        return logits, output
+    
+    @staticmethod
+    def load(model_path: str):
+        params = torch.load(model_path, map_location=lambda storage, loc: storage)
+        args = params["args"]
+        model = Feat2AnnotFCModel(**args)
+        model.load_state_dict(params["state_dict"])
+        return model
+
+    def save(self, path: str):
+        print(f"save model parameters to {path}")
+        params = {
+            "args": dict(
+                input_size=self.input_size,
+                hidden_size=self.hidden_size,
+                target_class={"class": self.target_class, "weight": self.class_weight},
+                dropout_rate=self.dropout_rate,
+                
+            ),
+            "state_dict": self.state_dict(),
+        }
+
+        torch.save(params, path)
+
         
             
             

@@ -7,6 +7,7 @@ from tqdm import tqdm
 from torch.nn import functional as F
 import argparse
 import time
+from matplotlib import pyplot
 
 
 from Feat2Annot import Feat2AnnotFCModel
@@ -36,7 +37,7 @@ argp.add_argument(
 )
 argp.add_argument(
     "--read_params_path",
-    default=None,
+    default="fcparams.param",
 )
 argp.add_argument(
     "--write_params_path",
@@ -54,6 +55,15 @@ argp.add_argument(
     "--val_every",
     default=20000,
 )
+argp.add_argument(
+    "--patience",
+    default=3,
+)
+argp.add_argument(
+    "--startover",
+    action="store_true"
+) # if passed, is true, else false
+
 args = argp.parse_args()
 device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 dataset = prepare_dataset_discrete(args.path,device=device)
@@ -79,7 +89,7 @@ train_sampler = WeightedRandomSampler(weights=sample_weight[train_idx], num_samp
 val_sampler = WeightedRandomSampler(weights=sample_weight[val_idx], num_samples=len(val_idx),replacement=True)
 
 train_dataloader = DataLoader(train_data, batch_size=batch_size, sampler=train_sampler)
-val_dataloader = DataLoader(val_data, batch_size=batch_size, sampler=val_sampler)
+val_dataloader = DataLoader(val_data, batch_size=batch_size, shuffle=False)
 
 # for i in range(10):
 #     _,b = next(train_dataloader)
@@ -91,32 +101,51 @@ val_dataloader = DataLoader(val_data, batch_size=batch_size, sampler=val_sampler
     
 
 print(dataset.get_annot_class())
-hidden_size = [2048,2048,2048]
-model = Feat2AnnotFCModel(
-    input_size = dataset._num_feature,
-    hidden_size=hidden_size,
-    target_class=dataset.get_annot_class()
-)
+if not args.startover:
+    try:
+        model = Feat2AnnotFCModel.load(params_read_path)
+        print(f"loading from previous training results")
+    except:  
+        hidden_size = [2048,2048,2048]
+        model = Feat2AnnotFCModel(
+            input_size = dataset._num_feature,
+            hidden_size=hidden_size,
+            target_class=dataset.get_annot_class()
+        )
+else:
+    hidden_size = [2048,2048,200]
+    model = Feat2AnnotFCModel(
+        input_size = dataset._num_feature,
+        hidden_size=hidden_size,
+        target_class=dataset.get_annot_class()
+    )
 model = model.to(device)
 metric = metrics.MulticlassAccuracy()
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-epoch = train_iter = log_iter = val_iter = cum_loss = total_iter = 0
+epoch = train_iter = log_iter = val_iter = cum_loss = total_iter = patience_score = 0
 model.train()
 loss = torch.nn.CrossEntropyLoss()
 begin_time = time.time()
+val_metrics = []
+loss_history = []
 while epoch+1<=nepoch:
     epoch+=1
+    if patience_score > args.patience:
+        print(f"hit maximum patience, stop training!")
+        break
     for source_feature, tgt_annot in train_dataloader:
         train_iter += 1
         val_iter += 1
         total_iter += 1
         optimizer.zero_grad()
-        logits = F.log_softmax(model(source_feature),dim=-1)
+        logits,_ = model(source_feature)
+        logits = F.log_softmax(logits,dim=-1)
         celoss = loss(logits, tgt_annot.squeeze(1))
         celoss = celoss.sum()/train_batch_size
         celoss.backward()
         optimizer.step()
         celoss_val = celoss.item()
+        loss_history.append(celoss_val)
         cum_loss += celoss_val
         if train_iter >= log_every:
             log_iter += 1
@@ -128,17 +157,28 @@ while epoch+1<=nepoch:
             model.eval()
             metric.reset()
             hat_count = torch.zeros((dataset.get_annot_class()["class"],), device=device,dtype=torch.int64)
-            for source_feature,tgt_annot in tqdm(val_dataloader):
-                logits = model(source_feature)
-                annot_hat = torch.argmax(logits,dim=-1)
-                metric.update(annot_hat,tgt_annot.squeeze(1))
-                labels,count = torch.unique(annot_hat, return_counts=True)
-                temp_count = torch.zeros_like(hat_count,device=device)
-                temp_count[labels] = count
-                hat_count+=temp_count
+            with torch.no_grad():
+                for source_feature,tgt_annot in tqdm(val_dataloader):
+                    logits,_ = model(source_feature)
+                    annot_hat = torch.argmax(logits,dim=-1)
+                    metric.update(annot_hat,tgt_annot.squeeze(1))
+                    labels,count = torch.unique(annot_hat, return_counts=True)
+                    temp_count = torch.zeros_like(hat_count,device=device)
+                    temp_count[labels] = count
+                    hat_count+=temp_count
             val_metric = metric.compute()
             print(f"validation accuracy {val_metric}")
+            if len(val_metrics) == 0 or (val_metric - val_metrics[-1])>-0.02:
+                val_metrics.append(val_metric)
+                model.save(params_write_path)
+            else:
+                # reverting back to previous best params
+                model = Feat2AnnotFCModel.load(params_read_path)
+                model = model.to(device)
+                patience_score+=1
+                print(f"validation accuracy is worse. reverting back to previous best model...hitting patience {patience_score}")
             print(hat_count)
             metric.reset()
             model.train()
             val_iter = 0
+

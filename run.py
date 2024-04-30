@@ -30,6 +30,7 @@ Options:
     --valid-niter=<int>                     perform validation after how many iterations [default: 2000]
     --dropout=<float>                       dropout [default: 0.3]
     --max-decoding-time-step=<int>          maximum number of decoding time steps [default: 70]
+    --fc-path=<str>                         use fc network to preprocess the features [default: ""]
 """
 import math
 import sys
@@ -41,7 +42,7 @@ directory_separator = os.sep
 
 
 # from docopt import docopt
-from Feat2Annot import Hypothesis, Feat2AnnotModel
+from Feat2Annot import Hypothesis, Feat2AnnotModel, Feat2AnnotFCModel
 from util import PoseDataset, prepare_dataset
 import numpy as np
 from typing import List, Tuple, Dict, Set, Union
@@ -68,33 +69,48 @@ def train(args: Dict):
     valid_niter = int(args["--valid-niter"])
     log_every = int(args["--log-every"])
     model_save_path = args["--save-to"]
-
+    fc_path = args["--fc-path"]
+    
+    
     generator1 = torch.Generator().manual_seed(42)
     train_data, val_data = torch.utils.data.random_split(
         dataset, (train_proportion, 1 - train_proportion), generator1
     )
     train_dataloader = DataLoader(train_data, shuffle=True, batch_size=train_batch_size)
     val_dataloader = DataLoader(val_data, shuffle=False, batch_size=1)
-
+    
+    if fc_path:
+        fc_model = Feat2AnnotFCModel.load(fc_path)
+        fc_model.to(device)
+        for param in fc_model.parameters():
+            param.requires_grad = False
+        fc_model.eval()
+        print(f"use pretrained FC, embed into Feat2Annot model")
+    else:
+        fc_model = None
+    
     model = Feat2AnnotModel(
         input_size=int(args["--feature-num"]),
         hidden_size=int(args["--hidden-size"]),
         dropout_rate=float(args["--dropout"]),
         target_class=dataset.get_annot_class(),
+        mlp=fc_model,
     )
     model = model.to(device)
+    
+
+    
     model.train()
 
     uniform_init = float(args["--uniform-init"])
     if np.abs(uniform_init) > 0.0:
         print(
-            "uniformly initialize parameters [-%f, +%f]" % (uniform_init, uniform_init),
-            file=sys.stderr,
+            f"uniformly initialize parameters [-{uniform_init}, +{uniform_init}]"
         )
         for p in model.parameters():
             p.data.uniform_(-uniform_init, uniform_init)
 
-    print("use device: %s" % device, file=sys.stderr)
+    print(f"use device: {device}")
 
     metric = metrics.MulticlassAccuracy()
 
@@ -117,7 +133,11 @@ def train(args: Dict):
             model.train()
 
             optimizer.zero_grad()
-
+            # if fc_model is not None:
+            #     B,L,D = source_feature.shape
+            #     source_feature = source_feature.view((-1,D))
+            #     source_feature,_ = fc_model(source_feature)
+            #     source_feature = source_feature.view((B,L,-1))
             example_losses = -model(source_feature, tgt_annot)  # (batch_size,)
             batch_loss = example_losses.sum()
 
@@ -173,12 +193,13 @@ def train(args: Dict):
                 cum_loss = cum_examples = 0.0
                 valid_num += 1
 
-                print("begin validation ...", file=sys.stderr)
+                print("begin validation ...")
 
                 # compute validation score
                 model.eval()
                 metric.reset()
                 for source_feature, tgt_annot in tqdm(val_dataloader):
+                        
                     annot_hypothesis = model.beam_search(source_feature, 1)
                     annot_hat = torch.tensor(
                         annot_hypothesis[0].value, dtype=torch.int64
@@ -186,9 +207,7 @@ def train(args: Dict):
                     metric.update(annot_hat, tgt_annot.squeeze(0))
                 valid_metric = metric.compute()
                 print(
-                    "validation: iter %d, multiclass accuracy %f"
-                    % (train_iter, valid_metric),
-                    file=sys.stderr,
+                    f"validation: iter {train_iter}, multiclass accuracy {valid_metric}"
                 )
 
                 is_better = len(hist_valid_scores) == 0 or valid_metric > max(
@@ -199,8 +218,7 @@ def train(args: Dict):
                 if is_better:
                     patience = 0
                     print(
-                        "save currently the best model to [%s]" % model_save_path,
-                        file=sys.stderr,
+                        f"save currently the best model to [{model_save_path}]"
                     )
                     model.save(model_save_path)
 
@@ -208,22 +226,20 @@ def train(args: Dict):
                     torch.save(optimizer.state_dict(), model_save_path + ".optim")
                 elif patience < int(args["--patience"]):
                     patience += 1
-                    print("hit patience %d" % patience, file=sys.stderr)
+                    print(f"hit patience {patience}")
 
                     if patience == int(args["--patience"]):
                         num_trial += 1
-                        print("hit #%d trial" % num_trial, file=sys.stderr)
+                        print(f"hit #{num_trial} trial")
                         if num_trial == int(args["--max-num-trial"]):
-                            print("early stop!", file=sys.stderr)
+                            print("early stop!")
                             exit(0)
 
                         # decay lr, and restore from previously best checkpoint
                         lr = optimizer.param_groups[0]["lr"] * float(args["--lr-decay"])
                         print(
-                            "load previously best model and decay learning rate to %f"
-                            % lr,
-                            file=sys.stderr,
-                        )
+                            f"load previously best model and decay learning rate to {lr}"
+                            )
 
                         # load model
                         params = torch.load(
@@ -232,7 +248,7 @@ def train(args: Dict):
                         model.load_state_dict(params["state_dict"])
                         # model = model.to(device)
 
-                        print("restore parameters of the optimizers", file=sys.stderr)
+                        print("restore parameters of the optimizers")
                         optimizer.load_state_dict(
                             torch.load(model_save_path + ".optim")
                         )
@@ -245,7 +261,7 @@ def train(args: Dict):
                         patience = 0
 
                 if epoch == int(args["--max-epoch"]):
-                    print("reached maximum number of epochs!", file=sys.stderr)
+                    print("reached maximum number of epochs!")
                     exit(0)
 
 
